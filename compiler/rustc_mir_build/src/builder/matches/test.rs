@@ -19,7 +19,9 @@ use rustc_span::{DUMMY_SP, Span, Symbol, sym};
 use tracing::{debug, instrument};
 
 use crate::builder::Builder;
-use crate::builder::matches::{MatchPairTree, Test, TestBranch, TestKind, TestableCase};
+use crate::builder::matches::{
+    MatchPairTree, PatConstKind, SliceLenOp, Test, TestBranch, TestKind, TestableCase,
+};
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Identifies what test is needed to decide if `match_pair` is applicable.
@@ -32,11 +34,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let kind = match match_pair.testable_case {
             TestableCase::Variant { adt_def, variant_index: _ } => TestKind::Switch { adt_def },
 
-            TestableCase::Constant { .. } if match_pair.pattern_ty.is_bool() => TestKind::If,
-            TestableCase::Constant { .. } if is_switch_ty(match_pair.pattern_ty) => {
+            TestableCase::Constant { value: _, kind: PatConstKind::Bool } => TestKind::If,
+            TestableCase::Constant { value: _, kind: PatConstKind::IntOrChar } => {
                 TestKind::SwitchInt
             }
-            TestableCase::Constant { value } => {
+            TestableCase::Constant { value, kind: PatConstKind::Float } => {
+                TestKind::Eq { value, cast_ty: match_pair.pattern_ty }
+            }
+            TestableCase::Constant { value, kind: PatConstKind::Other } => {
                 TestKind::Eq { value, cast_ty: match_pair.pattern_ty }
             }
 
@@ -45,10 +50,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 TestKind::Range(Arc::clone(range))
             }
 
-            TestableCase::Slice { len, variable_length } => {
-                let op = if variable_length { BinOp::Ge } else { BinOp::Eq };
-                TestKind::Len { len: len as u64, op }
-            }
+            TestableCase::Slice { len, op } => TestKind::SliceLen { len, op },
 
             TestableCase::Deref { temp, mutability } => TestKind::Deref { temp, mutability },
 
@@ -116,7 +118,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let switch_targets = SwitchTargets::new(
                     target_blocks.iter().filter_map(|(&branch, &block)| {
                         if let TestBranch::Constant(value) = branch {
-                            let bits = value.valtree.unwrap_leaf().to_bits_unchecked();
+                            let bits = value.to_leaf().to_bits_unchecked();
                             Some((bits, block))
                         } else {
                             None
@@ -148,7 +150,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let mut expect = self.literal_operand(test.span, Const::from_ty_value(tcx, value));
 
                 let mut place = place;
-                let mut block = block;
+
                 match cast_ty.kind() {
                     ty::Str => {
                         // String literal patterns may have type `str` if `deref_patterns` is
@@ -171,34 +173,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                             Rvalue::Ref(re_erased, BorrowKind::Shared, place),
                         );
                         place = ref_place;
-                        cast_ty = ref_str_ty;
-                    }
-                    ty::Adt(def, _) if tcx.is_lang_item(def.did(), LangItem::String) => {
-                        if !tcx.features().string_deref_patterns() {
-                            span_bug!(
-                                test.span,
-                                "matching on `String` went through without enabling string_deref_patterns"
-                            );
-                        }
-                        let re_erased = tcx.lifetimes.re_erased;
-                        let ref_str_ty = Ty::new_imm_ref(tcx, re_erased, tcx.types.str_);
-                        let ref_str = self.temp(ref_str_ty, test.span);
-                        let eq_block = self.cfg.start_new_block();
-                        // `let ref_str: &str = <String as Deref>::deref(&place);`
-                        self.call_deref(
-                            block,
-                            eq_block,
-                            place,
-                            Mutability::Not,
-                            cast_ty,
-                            ref_str,
-                            test.span,
-                        );
-                        // Since we generated a `ref_str = <String as Deref>::deref(&place) -> eq_block` terminator,
-                        // we need to add all further statements to `eq_block`.
-                        // Similarly, the normal test code should be generated for the `&str`, instead of the `String`.
-                        block = eq_block;
-                        place = ref_str;
                         cast_ty = ref_str_ty;
                     }
                     &ty::Pat(base, _) => {
@@ -307,7 +281,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 }
             }
 
-            TestKind::Len { len, op } => {
+            TestKind::SliceLen { len, op } => {
                 let usize_ty = self.tcx.types.usize;
                 let actual = self.temp(usize_ty, test.span);
 
@@ -327,7 +301,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     success_block,
                     fail_block,
                     source_info,
-                    op,
+                    match op {
+                        SliceLenOp::Equal => BinOp::Eq,
+                        SliceLenOp::GreaterOrEqual => BinOp::Ge,
+                    },
                     Operand::Move(actual),
                     Operand::Move(expected),
                 );
@@ -489,11 +466,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             TerminatorKind::if_(Operand::Move(eq_result), success_block, fail_block),
         );
     }
-}
-
-/// Returns true if this type be used with [`TestKind::SwitchInt`].
-pub(crate) fn is_switch_ty(ty: Ty<'_>) -> bool {
-    ty.is_integral() || ty.is_char()
 }
 
 fn trait_method<'tcx>(
