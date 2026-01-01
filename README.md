@@ -70,7 +70,7 @@ If you want to use these names or brands, please read the
 [Rust language trademark policy][trademark-policy].
 
 Third-party logos may be subject to third-party copyrights and trademarks. See
-[Licenses][policies-licenses] for details.
+[Licenses][policies-licenses] for more details.
 
 [rust-foundation]: https://rustfoundation.org/
 [trademark-policy]: https://rustfoundation.org/policy/rust-trademark-policy/
